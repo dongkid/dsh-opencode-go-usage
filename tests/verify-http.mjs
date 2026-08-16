@@ -72,5 +72,53 @@ await check('代理不可达自动回退直连 (HTTPS_PROXY=127.0.0.1:9)', async
   console.log('   fallback direct OK')
 })
 
+// ── 官方明细通道 (parseServerText + runOfficialHttp) ──────────────────────
+const start2 = src.indexOf('function parseServerText')
+const end2 = src.indexOf('async function collectOfficial')
+if (start2 < 0 || end2 < 0) throw new Error('could not locate official block in lib/index.js')
+const block2 = src.slice(start2, end2)
+const factory2 = new Function(
+  '_ocgoHttpsRequest', '_ocgoNetConnect', '_ocgoTlsConnect', '_ocgoExecFile',
+  '_ocgoJoin', '_ocgoHomedir', '_ocgoReadFileSync', '_ocgoMkdirSync', '_ocgoWriteFileSync',
+  'httpRequest', 'mapLimit', 'process', 'URL', 'Promise',
+  block2 + '; return { parseServerText, runOfficialHttp }',
+)
+const mapLimit = async (items, limit, fn) => {
+  const out = new Array(items.length)
+  let i = 0
+  const worker = async () => { while (i < items.length) { const idx = i++; out[idx] = await fn(items[idx], idx) } }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker))
+  return out
+}
+const api2 = factory2(_ocgoHttpsRequest, _ocgoNetConnect, _ocgoTlsConnect, _ocgoExecFile, _ocgoJoin, _ocgoHomedir, _ocgoReadFileSync, (await import('node:fs')).mkdirSync, (await import('node:fs')).writeFileSync, api.httpRequest, mapLimit, process, URL, Promise)
+
+await check('usage.list 第一页: 真实拉取 + server-fn 解析', async () => {
+  const cfg = JSON.parse(readFileSync(process.env.USERPROFILE + '\\.config\\dsh-opencode-go-usage.json', 'utf8'))
+  const FID = 'bfd684bfc2e4eed05cd0b518f5e4eafd3f3376e3938abb9e536e7c03df831e5c'
+  const argsEnc = encodeURIComponent(JSON.stringify([cfg.workspaceId, 0]))
+  const r = await api.httpRequest('https://opencode.ai/_server?id=' + FID + '&args=' + argsEnc, {
+    headers: { Cookie: 'auth=' + cfg.authCookie, 'X-Server-Id': FID, 'X-Server-Instance': 'server-fn:ocgo-0' },
+  })
+  if (r.status !== 200) throw new Error('status ' + r.status)
+  const rows = api2.parseServerText(r.text)
+  if (rows.length === 0) throw new Error('no usg_ records parsed')
+  const first = rows[0]
+  if (!first.ts || !first.model || typeof first.cost !== 'number') throw new Error('bad record: ' + JSON.stringify(first))
+  console.log(`   page0: ${rows.length} records; first: ${first.model} ts=${first.ts} cost=${first.cost}`)
+})
+
+await check('runOfficialHttp 增量模式 (LAST=最新 ts) 只拉新增', async () => {
+  const cfg = JSON.parse(readFileSync(process.env.USERPROFILE + '\\.config\\dsh-opencode-go-usage.json', 'utf8'))
+  const FID = 'bfd684bfc2e4eed05cd0b518f5e4eafd3f3376e3938abb9e536e7c03df831e5c'
+  const argsEnc = encodeURIComponent(JSON.stringify([cfg.workspaceId, 0]))
+  const r = await api.httpRequest('https://opencode.ai/_server?id=' + FID + '&args=' + argsEnc, {
+    headers: { Cookie: 'auth=' + cfg.authCookie, 'X-Server-Id': FID, 'X-Server-Instance': 'server-fn:ocgo-0' },
+  })
+  const latest = api2.parseServerText(r.text)[0].ts
+  const p = await api2.runOfficialHttp([['OCGO_LAST_TS', latest]])
+  if (!p.ok) throw new Error('incremental failed: ' + JSON.stringify(p).slice(0, 200))
+  console.log(`   incremental returned ${p.records.length} new record(s)`)
+})
+
 console.log(failures === 0 ? '\nALL HTTP-BACKEND CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`)
 process.exit(failures === 0 ? 0 : 1)
