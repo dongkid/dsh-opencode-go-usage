@@ -487,6 +487,154 @@ return {
     ].join('\n')
     const QUOTA_PY_PAYLOAD = utf8B64(QUOTA_PY)
 
+    // --- 凭据解析:OPENCODE_GO_API_KEY 环境变量 → $DSH_HOME/.credentials.yaml → opencode auth.json ---
+    function resolveGoKey() {
+      const env = (typeof process !== 'undefined' && process.env) ? process.env : {}
+      if (env.OPENCODE_GO_API_KEY) return String(env.OPENCODE_GO_API_KEY).trim()
+      if (typeof _ocgoReadFileSync !== 'undefined') {
+        try {
+          const home = (typeof _ocgoHomedir !== 'undefined') ? _ocgoHomedir() : (env.USERPROFILE || env.HOME || '')
+          const dshHome = env.DSH_HOME || _ocgoJoin(home, '.dsh')
+          const m = /^OPENCODE_GO_API_KEY\s*:\s*["']?([^"'\s]+)/m.exec(_ocgoReadFileSync(_ocgoJoin(dshHome, '.credentials.yaml'), 'utf8'))
+          if (m && m[1]) return m[1].trim()
+        } catch (e) { /* 文件缺失/解析失败 → 下一级 */ }
+        try {
+          const home = (typeof _ocgoHomedir !== 'undefined') ? _ocgoHomedir() : (env.USERPROFILE || env.HOME || '')
+          const auth = JSON.parse(_ocgoReadFileSync(_ocgoJoin(home, '.local', 'share', 'opencode', 'auth.json'), 'utf8'))
+          if (auth && auth['opencode-go'] && auth['opencode-go'].key) return String(auth['opencode-go'].key).trim()
+        } catch (e) { /* 无 auth.json → null */ }
+      }
+      return null
+    }
+
+    // --- NO_PROXY 匹配(精确/子域/.后缀/* 通配) ---
+    function isNoProxy(hostname) {
+      const env = (typeof process !== 'undefined' && process.env) ? process.env : {}
+      const rules = (env.NO_PROXY || env.no_proxy || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+      if (rules.length === 0) return false
+      const host = String(hostname || '').toLowerCase()
+      return rules.some((rule) => {
+        if (rule === '*') return true
+        if (rule.startsWith('.')) return host.endsWith(rule)
+        if (rule.endsWith('.*')) return host.endsWith(rule.slice(0, -1))
+        return host === rule || host.endsWith('.' + rule)
+      })
+    }
+
+    // --- 代理解析 1:环境变量(HTTPS_PROXY/https_proxy/HTTP_PROXY/http_proxy/ALL_PROXY/all_proxy) ---
+    function proxyFromEnv(hostname) {
+      if (isNoProxy(hostname)) return null
+      const env = (typeof process !== 'undefined' && process.env) ? process.env : {}
+      const candidates = [env.HTTPS_PROXY, env.https_proxy, env.HTTP_PROXY, env.http_proxy, env.ALL_PROXY, env.all_proxy]
+      for (const raw of candidates) {
+        if (!raw) continue
+        try {
+          const u = new URL(String(raw))
+          if (u.protocol === 'http:' || u.protocol === 'https:') {
+            return { host: u.hostname, port: Number(u.port || (u.protocol === 'https:' ? 443 : 80)) }
+          }
+        } catch (e) { /* 非法代理值 → 下一个 */ }
+      }
+      return null
+    }
+
+    // --- 代理解析 2:Windows 系统代理(WinINET 注册表, ProxyEnable=1 且 ProxyServer 非空) ---
+    function readWindowsProxy() {
+      return new Promise((resolve) => {
+        if (typeof _ocgoExecFile === 'undefined' || (typeof process !== 'undefined' && process.platform !== 'win32')) { resolve(null); return }
+        _ocgoExecFile('reg.exe', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'], { windowsHide: true, timeout: 5000 }, (err, stdout) => {
+          if (err) { resolve(null); return }
+          const enable = /ProxyEnable\s+REG_DWORD\s+0x([0-9a-fA-F]+)/.exec(stdout)
+          if (!enable || parseInt(enable[1], 16) !== 1) { resolve(null); return }
+          const m = /ProxyServer\s+REG_SZ\s+([^\r\n]+)/.exec(stdout)
+          if (!m) { resolve(null); return }
+          const raw = m[1].trim()
+          // 格式 "host:port" 或 "http=host:port;https=host:port"
+          let target = raw
+          const parts = raw.split(';').map(s => s.trim()).filter(Boolean)
+          if (parts.length > 1) {
+            const httpEntry = parts.find(s => /^https?=/.test(s))
+            target = httpEntry ? httpEntry.replace(/^https?=/, '') : parts[0]
+          }
+          const um = /^([^:]+):(\d+)$/.exec(target)
+          if (!um) { resolve(null); return }
+          resolve({ host: um[1], port: Number(um[2]) })
+        })
+      })
+    }
+
+    // --- 零依赖 HTTP 客户端:Node 进程内直连,或经 HTTP CONNECT 隧道走代理(自动读系统代理) ---
+    // bundle 形态可用(node:https/net/tls 由 build-lib 注入);动态形态无注入符号,调用方需守卫。
+    function httpRequest(url, opts) {
+      return new Promise((resolve, reject) => {
+        const u = new URL(url)
+        const headers = Object.assign({ 'User-Agent': 'dsh-ocgo-usage', Accept: 'application/json' }, opts.headers || {})
+        const method = opts.method || 'GET'
+        const body = opts.body
+        let settled = false
+        const finish = (fn, v) => { if (!settled) { settled = true; fn(v) } }
+        const doRequest = (socket) => {
+          let req
+          try {
+            req = _ocgoHttpsRequest({
+              hostname: u.hostname,
+              port: u.port || 443,
+              path: u.pathname + u.search,
+              method,
+              headers,
+              servername: u.hostname,
+              createConnection: socket ? () => socket : undefined,
+            }, (res) => {
+              let text = ''
+              res.setEncoding('utf8')
+              res.on('data', (c) => { text += c })
+              res.on('end', () => finish(resolve, { status: res.statusCode || 0, text }))
+            })
+          } catch (e) { finish(reject, e); return }
+          req.on('error', (e) => finish(reject, e))
+          if (body) req.write(body)
+          req.end()
+        }
+        const tunnel = (proxy) => {
+          let directFallback = false
+          // 代理不可达/CONNECT 失败 → 自动回退直连(系统代理开着但客户端没跑时仍可用)
+          const fallbackDirect = (e) => {
+            if (directFallback) { if (!settled) finish(reject, e); return }
+            directFallback = true
+            doRequest(null)
+          }
+          const sock = _ocgoNetConnect(proxy.port, proxy.host, () => {
+            sock.write('CONNECT ' + u.hostname + ':' + (u.port || 443) + ' HTTP/1.1\r\nHost: ' + u.hostname + ':' + (u.port || 443) + '\r\n\r\n')
+          })
+          let buf = ''
+          sock.on('data', (d) => {
+            buf += d.toString('latin1')
+            const idx = buf.indexOf('\r\n\r\n')
+            if (idx < 0) { if (buf.length > 16384) { sock.destroy(); fallbackDirect(new Error('proxy CONNECT response too large')) }; return }
+            const head = buf.slice(0, idx)
+            const m = /^HTTP\/1\.[01]\s+(\d+)/.exec(head)
+            if (m && m[1] === '200') {
+              sock.removeAllListeners('data')
+              const tlsSock = _ocgoTlsConnect({ socket: sock, servername: u.hostname })
+              tlsSock.on('error', (e) => fallbackDirect(e))
+              doRequest(tlsSock)
+            } else {
+              sock.destroy()
+              fallbackDirect(new Error('proxy CONNECT failed: ' + head.split('\r\n')[0]))
+            }
+          })
+          sock.on('error', (e) => fallbackDirect(e))
+          sock.on('close', () => { if (!directFallback && !settled) fallbackDirect(new Error('proxy connection closed before CONNECT')) })
+        }
+        const envProxy = proxyFromEnv(u.hostname)
+        if (envProxy) { tunnel(envProxy); return }
+        readWindowsProxy().then((sysProxy) => {
+          if (sysProxy && !isNoProxy(u.hostname)) tunnel(sysProxy)
+          else doRequest(null)
+        }).catch(() => doRequest(null))
+      })
+    }
+
     async function collectQuota() {
       const parse = (text) => {
         try {
@@ -506,7 +654,23 @@ return {
       const stdoutText = (raw) => typeof raw === 'string' ? raw : (raw && raw.text != null ? String(raw.text) : '')
       const plat = (typeof process !== 'undefined' && process.platform) || ''
 
-      // 通道 1:curl(native TLS,代理兼容;key 不进日志)。Windows 用 pwsh 读取,
+      // 通道 1(主):Node 进程内 HTTP 直连/代理隧道 —— 不经过 ctx.shell,完全不受 DSH
+      // 沙箱后端约束;bundle 形态可用(build-lib 注入 node:https/net/tls),动态形态
+      // 无注入符号,自动落到通道 2 的 shell 降级。
+      if (typeof _ocgoHttpsRequest !== 'undefined') {
+        try {
+          const key = resolveGoKey()
+          if (!key) return { error: 'quota: 未找到 OPENCODE_GO_API_KEY(环境变量/.credentials.yaml/auth.json 均无)' }
+          const r = await httpRequest('https://opencode.ai/zen/go/v1/usage', { headers: { Authorization: 'Bearer ' + key } })
+          if (r.status !== 200) return { error: 'quota http ' + r.status + ': ' + String(r.text).slice(0, 200) }
+          const parsed = parse(r.text)
+          return parsed.error ? { error: 'quota http 200 但解析失败: ' + parsed.error } : parsed
+        } catch (e) {
+          return { error: 'quota http 异常: ' + String((e && e.message) || e) }
+        }
+      }
+
+      // 通道 2(降级):curl(native TLS,代理兼容;key 不进日志)。Windows 用 pwsh 读取,
       // macOS/Linux 用 python3 一行读取 key。
       const curlCmd = (plat === 'darwin' || plat === 'linux')
         ? "PY=$(command -v python3 || command -v python || true); if [ -z \"$PY\" ]; then exit 1; fi; K=$(\"$PY\" -c 'import json,os;d=json.load(open(os.path.expanduser(\"~/.local/share/opencode/auth.json\")));print((d.get(\"opencode-go\") or {}).get(\"key\") or \"\")' 2>/dev/null); if [ -z \"$K\" ]; then exit 1; fi; curl -s -m 15 -H \"Authorization: Bearer $K\" https://opencode.ai/zen/go/v1/usage"
@@ -753,7 +917,7 @@ return {
         } else {
           scanP = collectDshScan().catch(() => [])
         }
-        const quotaP = collectQuota().catch(() => ({ error: 'quota 异常' }))
+        const quotaP = collectQuota().catch((e) => ({ error: 'quota: ' + String((e && e.message) || e) }))
         // 数据实时性:磁盘/内存缓存只用于"启动秒开",每次刷新都增量抓最新页
         // (1-2s),不再等 15 分钟过期——60s 轮询/手动刷新都能拿到最新数据。
         let off = officialCache ? officialCache.data : null

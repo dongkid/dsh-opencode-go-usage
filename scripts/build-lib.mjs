@@ -33,6 +33,10 @@ function buildHost() {
     "import { writeFileSync as _ocgoWriteFileSync, mkdirSync as _ocgoMkdirSync, readFileSync as _ocgoReadFileSync, existsSync as _ocgoExistsSync } from 'node:fs'",
     "import { join as _ocgoJoin } from 'node:path'",
     "import { homedir as _ocgoHomedir } from 'node:os'",
+    "import { request as _ocgoHttpsRequest } from 'node:https'",
+    "import { connect as _ocgoNetConnect } from 'node:net'",
+    "import { connect as _ocgoTlsConnect } from 'node:tls'",
+    "import { execFile as _ocgoExecFile } from 'node:child_process'",
     '',
   ].join('\n')
   const outText = 'export const name = ' + JSON.stringify(HOST_NAME) + '\n' +
