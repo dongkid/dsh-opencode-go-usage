@@ -134,14 +134,24 @@ await check('runOfficialHttp 增量模式 (LAST=最新 ts) 只拉新增', async 
   const hadDisk = fs.existsSync(diskPath)
   if (hadDisk) fs.copyFileSync(diskPath, bak)
   try {
-    const argsEnc = encodeURIComponent(JSON.stringify([cfg.workspaceId, 0]))
-    const r = await api.httpRequest('https://opencode.ai/_server?id=' + FID + '&args=' + argsEnc, {
-      headers: { Cookie: 'auth=' + cfg.authCookie, 'X-Server-Id': FID, 'X-Server-Instance': 'server-fn:ocgo-0' },
-    })
-    const latest = api2.parseServerText(r.text)[0].ts
+    const page0 = async () => {
+      const argsEnc = encodeURIComponent(JSON.stringify([cfg.workspaceId, 0]))
+      const r = await api.httpRequest('https://opencode.ai/_server?id=' + FID + '&args=' + argsEnc, {
+        headers: { Cookie: 'auth=' + cfg.authCookie, 'X-Server-Id': FID, 'X-Server-Instance': 'server-fn:ocgo-0' },
+      })
+      if (r.status !== 200) throw new Error('status ' + r.status)
+      return api2.parseServerText(r.text)
+    }
+    const rows0 = await page0()
+    // 增量依赖旧盘存在(合并基础);无盘时用 page 0 前 10 条合成一个最小旧盘
+    if (!hadDisk) {
+      fs.writeFileSync(diskPath, JSON.stringify({ at: Date.now(), records: rows0.slice(0, 10) }))
+    }
+    const latest = rows0[0].ts
     const p = await api2.runOfficialHttp([['OCGO_LAST_TS', latest]])
     if (!p.ok) throw new Error('incremental failed: ' + JSON.stringify(p).slice(0, 200))
-    console.log(`   incremental returned ${p.records.length} new record(s)`)
+    if (!hadDisk && p.records.length < 10) throw new Error('synthetic old disk not merged: ' + p.records.length)
+    console.log(`   incremental returned ${p.records.length} record(s) (old disk ${hadDisk ? 'preserved' : 'synthetic 10'})`)
   } finally {
     try { fs.rmSync(diskPath, { force: true }) } catch (e) {}
     if (hadDisk) { try { fs.copyFileSync(bak, diskPath); fs.rmSync(bak, { force: true }) } catch (e) {} }
