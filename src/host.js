@@ -471,12 +471,24 @@ return {
 
     // --- 数据源 4:官方配额(双通道容错:curl native TLS 优先,python urllib 兜底) ---
     const QUOTA_PY = [
-      'import json, os, urllib.request',
+      'import json, os, re, urllib.request',
       'HOME = os.environ.get("USERPROFILE") or os.environ.get("HOME") or r"C:\\Users\\Xenia"',
       'AUTH = os.path.join(HOME, ".local", "share", "opencode", "auth.json")',
+      'def load_key():',
+      '    # 与 bundle 通道同优先级:OPENCODE_GO_API_KEY env → $DSH_HOME/.credentials.yaml → auth.json',
+      '    k = os.environ.get("OPENCODE_GO_API_KEY")',
+      '    if k: return k.strip()',
+      '    dsh = os.environ.get("DSH_HOME") or os.path.join(HOME, ".dsh")',
+      '    try:',
+      '        for line in open(os.path.join(dsh, ".credentials.yaml"), encoding="utf-8"):',
+      '            m = re.match(r"OPENCODE_GO_API_KEY\\s*:\\s*[\\"\\\']?([^\\"\\\'\\s]+)", line)',
+      '            if m: return m.group(1).strip()',
+      '    except Exception: pass',
+      '    try:',
+      '        return json.load(open(AUTH, encoding="utf-8")).get("opencode-go", {}).get("key") or None',
+      '    except Exception: return None',
       'try:',
-      '    with open(AUTH, "r", encoding="utf-8") as f:',
-      '        key = json.load(f).get("opencode-go", {}).get("key")',
+      '    key = load_key()',
       '    if not key:',
       '        raise RuntimeError("no key")',
       '    req = urllib.request.Request("https://opencode.ai/zen/go/v1/usage", headers={"Authorization": "Bearer " + key, "User-Agent": "dsh-ocgo-usage"})',
@@ -515,8 +527,8 @@ return {
       const host = String(hostname || '').toLowerCase()
       return rules.some((rule) => {
         if (rule === '*') return true
-        if (rule.startsWith('.')) return host.endsWith(rule)
-        if (rule.endsWith('.*')) return host.endsWith(rule.slice(0, -1))
+        if (rule.startsWith('.')) return host === rule.slice(1) || host.endsWith(rule)
+        if (rule.endsWith('.*')) return host.endsWith(rule.slice(0, -2))
         return host === rule || host.endsWith('.' + rule)
       })
     }
@@ -539,7 +551,8 @@ return {
     }
 
     // --- 代理解析 2:Windows 系统代理(WinINET 注册表, ProxyEnable=1 且 ProxyServer 非空) ---
-    function readWindowsProxy() {
+    // scheme: 'http' | 'https' —— 多协议代理("http=...;https=...")时按目标协议选择专用项
+    function readWindowsProxy(scheme) {
       return new Promise((resolve) => {
         if (typeof _ocgoExecFile === 'undefined' || (typeof process !== 'undefined' && process.platform !== 'win32')) { resolve(null); return }
         _ocgoExecFile('reg.exe', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'], { windowsHide: true, timeout: 5000 }, (err, stdout) => {
@@ -550,11 +563,13 @@ return {
           if (!m) { resolve(null); return }
           const raw = m[1].trim()
           // 格式 "host:port" 或 "http=host:port;https=host:port"
-          let target = raw
           const parts = raw.split(';').map(s => s.trim()).filter(Boolean)
+          let target = raw
           if (parts.length > 1) {
-            const httpEntry = parts.find(s => /^https?=/.test(s))
-            target = httpEntry ? httpEntry.replace(/^https?=/, '') : parts[0]
+            const want = scheme === 'https' ? 'https' : 'http'
+            const entry = parts.find(s => new RegExp('^' + want + '=').test(s))
+              || parts.find(s => /^(?:http|https)=/.test(s))
+            target = entry ? entry.replace(/^[a-z]+=/, '') : parts[0]
           }
           const um = /^([^:]+):(\d+)$/.exec(target)
           if (!um) { resolve(null); return }
@@ -563,8 +578,13 @@ return {
       })
     }
 
+    // 系统代理进程内缓存(解析一次复用;60s 轮询/16 并发分页不再反复 spawn reg.exe)
+    let cachedSysProxyPromise = null
+
     // --- 零依赖 HTTP 客户端:Node 进程内直连,或经 HTTP CONNECT 隧道走代理(自动读系统代理) ---
     // bundle 形态可用(node:https/net/tls 由 build-lib 注入);动态形态无注入符号,调用方需守卫。
+    const REQUEST_TIMEOUT_MS = 15000
+    const MAX_RESPONSE_BYTES = 8 * 1024 * 1024
     function httpRequest(url, opts) {
       return new Promise((resolve, reject) => {
         const u = new URL(url)
@@ -572,9 +592,27 @@ return {
         const method = opts.method || 'GET'
         const body = opts.body
         let settled = false
-        const finish = (fn, v) => { if (!settled) { settled = true; fn(v) } }
+        let req = null
+        let sock = null
+        let tlsSock = null
+        let timer = null
+        const clearTimer = () => { if (timer) { clearTimeout(timer); timer = null } }
+        const teardown = () => {
+          try { if (tlsSock) tlsSock.destroy() } catch (e) {}
+          try { if (sock) sock.destroy() } catch (e) {}
+          try { if (req) req.destroy() } catch (e) {}
+        }
+        const finish = (fn, v) => { if (!settled) { settled = true; clearTimer(); fn(v) } }
+        const armTimer = () => {
+          clearTimer()
+          timer = setTimeout(() => {
+            if (settled) return
+            settled = true
+            teardown()
+            reject(new Error('http request timeout (' + REQUEST_TIMEOUT_MS + 'ms): ' + u.hostname))
+          }, REQUEST_TIMEOUT_MS)
+        }
         const doRequest = (socket) => {
-          let req
           try {
             req = _ocgoHttpsRequest({
               hostname: u.hostname,
@@ -586,24 +624,40 @@ return {
               createConnection: socket ? () => socket : undefined,
             }, (res) => {
               let text = ''
+              let over = false
               res.setEncoding('utf8')
-              res.on('data', (c) => { text += c })
-              res.on('end', () => finish(resolve, { status: res.statusCode || 0, text }))
+              res.on('data', (c) => {
+                if (over) return
+                text += c
+                if (text.length > MAX_RESPONSE_BYTES) {
+                  over = true
+                  teardown()
+                  finish(reject, new Error('http response exceeds ' + MAX_RESPONSE_BYTES + ' bytes'))
+                }
+              })
+              res.on('end', () => { if (!over) finish(resolve, { status: res.statusCode || 0, text }) })
             })
           } catch (e) { finish(reject, e); return }
-          req.on('error', (e) => finish(reject, e))
+          req.on('error', (e) => { if (!settled) finish(reject, e) })
           if (body) req.write(body)
           req.end()
+          armTimer()
         }
         const tunnel = (proxy) => {
-          let directFallback = false
-          // 代理不可达/CONNECT 失败 → 自动回退直连(系统代理开着但客户端没跑时仍可用)
+          // phase: 'connect'(可回退直连) → 'tls'(隧道已建,失败直接报,不再回退/重发)
+          let phase = 'connect'
+          const cleanup = () => {
+            if (sock) { sock.removeAllListeners('data'); sock.removeAllListeners('error'); sock.removeAllListeners('close') }
+          }
           const fallbackDirect = (e) => {
-            if (directFallback) { if (!settled) finish(reject, e); return }
-            directFallback = true
+            if (settled) return
+            if (phase !== 'connect') { finish(reject, e); return }
+            phase = 'done'
+            cleanup()
             doRequest(null)
           }
-          const sock = _ocgoNetConnect(proxy.port, proxy.host, () => {
+          armTimer() // 覆盖 TCP 连接 + CONNECT 握手全程(黑洞 IP/代理挂起不会永久 pending)
+          sock = _ocgoNetConnect(proxy.port, proxy.host, () => {
             sock.write('CONNECT ' + u.hostname + ':' + (u.port || 443) + ' HTTP/1.1\r\nHost: ' + u.hostname + ':' + (u.port || 443) + '\r\n\r\n')
           })
           let buf = ''
@@ -614,9 +668,10 @@ return {
             const head = buf.slice(0, idx)
             const m = /^HTTP\/1\.[01]\s+(\d+)/.exec(head)
             if (m && m[1] === '200') {
-              sock.removeAllListeners('data')
-              const tlsSock = _ocgoTlsConnect({ socket: sock, servername: u.hostname })
-              tlsSock.on('error', (e) => fallbackDirect(e))
+              phase = 'tls'
+              cleanup()
+              tlsSock = _ocgoTlsConnect({ socket: sock, servername: u.hostname })
+              tlsSock.on('error', (e) => { if (!settled) finish(reject, e) })
               doRequest(tlsSock)
             } else {
               sock.destroy()
@@ -624,11 +679,14 @@ return {
             }
           })
           sock.on('error', (e) => fallbackDirect(e))
-          sock.on('close', () => { if (!directFallback && !settled) fallbackDirect(new Error('proxy connection closed before CONNECT')) })
+          sock.on('close', () => { if (!settled && phase === 'connect') fallbackDirect(new Error('proxy connection closed before CONNECT')) })
         }
         const envProxy = proxyFromEnv(u.hostname)
         if (envProxy) { tunnel(envProxy); return }
-        readWindowsProxy().then((sysProxy) => {
+        if (!cachedSysProxyPromise) {
+          cachedSysProxyPromise = readWindowsProxy(u.protocol === 'https:' ? 'https' : 'http').catch(() => null)
+        }
+        cachedSysProxyPromise.then((sysProxy) => {
           if (sysProxy && !isNoProxy(u.hostname)) tunnel(sysProxy)
           else doRequest(null)
         }).catch(() => doRequest(null))
@@ -671,10 +729,10 @@ return {
       }
 
       // 通道 2(降级):curl(native TLS,代理兼容;key 不进日志)。Windows 用 pwsh 读取,
-      // macOS/Linux 用 python3 一行读取 key。
+      // macOS/Linux 用 python3 一行读取 key(均与通道 1 同优先级:env → .credentials.yaml → auth.json)。
       const curlCmd = (plat === 'darwin' || plat === 'linux')
-        ? "PY=$(command -v python3 || command -v python || true); if [ -z \"$PY\" ]; then exit 1; fi; K=$(\"$PY\" -c 'import json,os;d=json.load(open(os.path.expanduser(\"~/.local/share/opencode/auth.json\")));print((d.get(\"opencode-go\") or {}).get(\"key\") or \"\")' 2>/dev/null); if [ -z \"$K\" ]; then exit 1; fi; curl -s -m 15 -H \"Authorization: Bearer $K\" https://opencode.ai/zen/go/v1/usage"
-        : '$k=(Get-Content "$env:USERPROFILE\\.local\\share\\opencode\\auth.json" -Raw|ConvertFrom-Json).\'opencode-go\'.key; if(-not $k){Write-Error "no-key";exit 1}; curl.exe -s -m 15 -H "Authorization: Bearer $k" https://opencode.ai/zen/go/v1/usage'
+        ? "PY=$(command -v python3 || command -v python || true); if [ -z \"$PY\" ]; then exit 1; fi; K=${OPENCODE_GO_API_KEY:-}; if [ -z \"$K\" ]; then K=$(\"$PY\" -c 'import os,re;home=os.environ.get(\"USERPROFILE\") or os.path.expanduser(\"~\");dsh=os.environ.get(\"DSH_HOME\") or os.path.join(home,\".dsh\");k=None\nimport json\nfor line in open(os.path.join(dsh,\".credentials.yaml\"),encoding=\"utf-8\"):\n m=re.match(r\"OPENCODE_GO_API_KEY\\s*:\\s*[\\\"\\']?([^\\\"\\'\\s]+)\",line)\n if m: k=m.group(1).strip(); break\ntry:\n d=json.load(open(os.path.join(home,\".local\",\"share\",\"opencode\",\"auth.json\"),encoding=\"utf-8\")); k=k or (d.get(\"opencode-go\") or {}).get(\"key\") or \"\"\nexcept Exception: pass\nprint(k or \"\")' 2>/dev/null); fi; if [ -z \"$K\" ]; then exit 1; fi; curl -s -m 15 -H \"Authorization: Bearer $K\" https://opencode.ai/zen/go/v1/usage"
+        : '$d="$env:DSH_HOME";if(-not $d){$d="$env:USERPROFILE\.dsh"};$k=$env:OPENCODE_GO_API_KEY;if(-not $k -and (Test-Path "$d\.credentials.yaml")){$k=[regex]::Match((Get-Content "$d\.credentials.yaml" -Raw),"OPENCODE_GO_API_KEY\s*:\s*[""'' ]?([^""''\s]+)").Groups[1].Value};if(-not $k){$k=(Get-Content "$env:USERPROFILE\.local\share\opencode\auth.json" -Raw|ConvertFrom-Json).''opencode-go''.key};if(-not $k){Write-Error "no-key";exit 1};curl.exe -s -m 15 -H "Authorization: Bearer $k" https://opencode.ai/zen/go/v1/usage'
       const c1 = await shell.run(shell.resolve({ command: curlCmd, timeoutMs: 20000 }))
       let c1err = null
       if (c1.exitCode === 0) {
@@ -771,7 +829,7 @@ return {
     }
     function toOfficialData(parsed) {
       const rows = (parsed.records || []).map((r, i) => ({
-        id: 'of-' + i,
+        id: r.id || 'of-' + i,
         title: null,
         model: r.model,
         provider: 'official',
@@ -817,12 +875,14 @@ return {
       const page = []
       for (const m of String(text).matchAll(/\{id:"usg_[^}]*?\}/g)) {
         const b = m[0]
+        const idM = /id:"(usg_[^"]+)"/.exec(b)
         const tsM = /new Date\("([^"]+)"\)/.exec(b)
         const modelM = /model:"([^"]+)"/.exec(b)
         const costM = /cost:(\d+)/.exec(b)
-        if (!(tsM && modelM && costM)) continue
+        if (!(idM && tsM && modelM && costM)) continue
         const num = (p) => { const mm = new RegExp(p).exec(b); return mm ? parseInt(mm[1], 10) : 0 }
         page.push({
+          id: idM[1],
           ts: tsM[1],
           model: modelM[1],
           ti: num('inputTokens:(\\d+)'),
@@ -849,8 +909,8 @@ return {
       // 1. 配置(authCookie + workspaceId)
       let cfg = null
       try { cfg = JSON.parse(_ocgoReadFileSync(_ocgoJoin(_ocgoHomedir(), '.config', 'dsh-opencode-go-usage.json'), 'utf8')) } catch (e) {}
-      const CK = (cfg && typeof cfg.authCookie === 'string' && cfg.authCookie) || ''
-      const WID = (cfg && typeof cfg.workspaceId === 'string' && cfg.workspaceId) || ''
+      const CK = String((cfg && typeof cfg.authCookie === 'string' && cfg.authCookie) || '').replace(/[\r\n]+/g, '').trim()
+      const WID = String((cfg && typeof cfg.workspaceId === 'string' && cfg.workspaceId) || '').replace(/[\r\n]+/g, '').trim()
       if (!CK || !WID) { out.error = 'NO_BROWSER'; return out }
       // 2. 磁盘缓存命中(全量模式,15 分钟内)
       if (!LAST) {
@@ -876,7 +936,7 @@ return {
             'User-Agent': UA,
           },
         })
-        if (r.status !== 200) return null
+        if (r.status !== 200) throw new Error('usage.list http ' + r.status + ': ' + String(r.text).slice(0, 120))
         return parseServerText(r.text)
       }
       try {
@@ -890,8 +950,8 @@ return {
             if (pgs === null || pgs.length === 0) { stop = true; break }
             out.records.push(...pgs)
             if (pgs.length < PAGE_SIZE) { stop = true; break }
-            // 增量模式:本页末尾已不新于 LAST → 后续页必然更旧,停止
-            if (LAST && pgs[pgs.length - 1].ts <= LAST) { stop = true; break }
+            // 增量模式:页内任一条不新于 LAST → 该页已覆盖 LAST 边界,后续页必然更旧,停止
+            if (LAST && pgs.some((p) => p.ts <= LAST)) { stop = true; break }
           }
           if (!stop) page = batch[batch.length - 1] + 1
           await new Promise((r) => setTimeout(r, 150))
@@ -899,20 +959,22 @@ return {
         out.truncated = out.records.length >= MAXP * PAGE_SIZE
         if (LAST) {
           const fresh = out.records.filter((r) => r.ts > LAST)
-          try {
-            const old = JSON.parse(_ocgoReadFileSync(diskPath, 'utf8'))
-            if (old && Array.isArray(old.records)) {
-              const seen = new Set()
-              const combined = []
-              for (const r of fresh.concat(old.records)) {
-                const k = [r.ts, r.model, r.cost, r.ti || 0, r.to || 0, r.rt || 0, r.cr || 0].join('|')
-                if (seen.has(k)) continue
-                seen.add(k)
-                combined.push(r)
-              }
-              out.records = combined
-            }
-          } catch (e) { /* 无旧盘 → 仅保留新记录 */ }
+          let old = null
+          try { old = JSON.parse(_ocgoReadFileSync(diskPath, 'utf8')) } catch (e) {}
+          if (!old || !Array.isArray(old.records)) {
+            // 旧盘不可读:宁可不刷新也不让增量结果覆盖全量历史
+            out.error = 'incremental disk cache unreadable; keeping existing cache'
+            return out
+          }
+          const seen = new Set()
+          const combined = []
+          for (const r of fresh.concat(old.records)) {
+            const k = [r.id || '', r.ts, r.model, r.cost, r.ti || 0, r.to || 0, r.rt || 0, r.cr || 0].join('|')
+            if (seen.has(k)) continue
+            seen.add(k)
+            combined.push(r)
+          }
+          out.records = combined
         }
         // 4. 写盘缓存
         try {

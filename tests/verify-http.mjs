@@ -120,5 +120,28 @@ await check('runOfficialHttp 增量模式 (LAST=最新 ts) 只拉新增', async 
   console.log(`   incremental returned ${p.records.length} new record(s)`)
 })
 
+await check('代理 accept 后挂起 → 15s 超时 reject (C1)', async () => {
+  const net = await import('node:net')
+  const server = net.createServer(() => { /* accept 后挂起,不回 CONNECT */ })
+  await new Promise((res) => server.listen(0, '127.0.0.1', res))
+  const port = server.address().port
+  const start = Date.now()
+  let outcome = 'no-settle'
+  try {
+    process.env.HTTPS_PROXY = 'http://127.0.0.1:' + port
+    await api.httpRequest('https://opencode.ai/zen/go/v1/usage', { headers: { Authorization: 'Bearer x' } })
+    outcome = 'resolved'
+  } catch (e) {
+    outcome = 'rejected: ' + e.message
+  }
+  delete process.env.HTTPS_PROXY
+  server.close()
+  const elapsed = Date.now() - start
+  if (!outcome.startsWith('rejected')) throw new Error('expected timeout reject, got: ' + outcome)
+  if (elapsed > 25000) throw new Error('timeout took too long: ' + elapsed + 'ms')
+  if (elapsed < 10000) throw new Error('rejected too early (not the 15s timer): ' + elapsed + 'ms')
+  console.log(`   rejected after ${elapsed}ms (timer OK)`)
+})
+
 console.log(failures === 0 ? '\nALL HTTP-BACKEND CHECKS PASSED' : `\n${failures} CHECK(S) FAILED`)
 process.exit(failures === 0 ? 0 : 1)
