@@ -46,6 +46,23 @@ await check('proxyFromEnv 解析 HTTPS_PROXY + NO_PROXY 直连', () => {
   delete process.env.HTTPS_PROXY
 })
 
+await check('NO_PROXY 前导星号 *.domain 通配 (H4)', () => {
+  process.env.NO_PROXY = '*.opencode.ai'
+  if (api.isNoProxy('opencode.ai') !== true) throw new Error('bare host should match *.opencode.ai')
+  if (api.isNoProxy('api.opencode.ai') !== true) throw new Error('subdomain should match *.opencode.ai')
+  if (api.isNoProxy('example.com') === true) throw new Error('unrelated host over-matched')
+  delete process.env.NO_PROXY
+})
+
+await check('proxyFromEnv 保留 user:pass@ 认证凭据 (H3)', () => {
+  process.env.HTTPS_PROXY = 'http://user:pa%40ss@127.0.0.1:8080'
+  const p = api.proxyFromEnv('opencode.ai')
+  if (!p || !p.auth) throw new Error('auth not preserved: ' + JSON.stringify(p))
+  const decoded = Buffer.from(p.auth, 'base64').toString('utf8')
+  if (decoded !== 'user:pa@ss') throw new Error('auth decode mismatch: ' + decoded)
+  delete process.env.HTTPS_PROXY
+})
+
 await check('readWindowsProxy 读到系统代理', async () => {
   const p = await api.readWindowsProxy()
   if (!p) throw new Error('no windows system proxy found')

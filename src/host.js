@@ -208,9 +208,10 @@ return {
     }
 
     // --- 官方账户级用量明细(usage.list server-fn) ---
-    // 凭据优先读配置 ~/.config/dsh-opencode-go-usage.json;缺失/过期时自动从
-    // Edge cookie 库提取(auth cookie → workspaces API 解析 workspaceId),Edge
-    // 运行时数据库被锁则返回 EDGE_RUNNING,由面板引导手动粘贴或关闭 Edge。
+    // 凭据读配置 ~/.config/dsh-opencode-go-usage.json(authCookie + workspaceId)。
+    // 注意:CDP 调试端口自动提取仅存在于本 python 兜底路径(动态模式);
+    // bundle 主通道(runOfficialHttp)不自动提取,缺配置时返回 NO_BROWSER,
+    // 请在面板错误区手动粘贴 authCookie/workspaceId(或经 /ocgo-usage/config 保存)。
     // 返回逐请求官方计费明细(cost 单位 1e-8 美元),账户级、跨设备,与官网账单一致。
     const OFFICIAL_SCRIPT = [
       'import json, os, re, time, urllib.request, urllib.parse, base64',
@@ -376,6 +377,8 @@ return {
       '            os.makedirs(os.path.dirname(CFG), exist_ok=True)',
       '            with open(CFG, "w", encoding="utf-8") as fh:',
       '                json.dump({"authCookie": CK, "workspaceId": WID}, fh, ensure_ascii=False)',
+      '            try: os.chmod(CFG, 0o600)',
+      '            except Exception: pass',
       '            out["autoExtracted"] = True',
       '            out["browser"] = src_browser',
       '        except Exception:',
@@ -437,7 +440,7 @@ return {
       '                    break',
       '                if LAST:',
       '                    # 增量:只保留比上次新的记录;本页时间已不新于上次即停止',
-      '                    out["records"].extend(r for r in pgs if r["ts"] > LAST)',
+      '                    out["records"].extend(r for r in pgs if r["ts"] >= LAST)',
       '                    if len(pgs) < PAGE_SIZE or pgs[-1]["ts"] <= LAST:',
       '                        page = MAXP',
       '                        break',
@@ -527,6 +530,8 @@ return {
       const host = String(hostname || '').toLowerCase()
       return rules.some((rule) => {
         if (rule === '*') return true
+        // curl/Node/Go 惯用的前导星号通配: *.opencode.ai → 裸域与其所有子域
+        if (rule.startsWith('*.')) return host === rule.slice(2) || host.endsWith(rule.slice(1))
         if (rule.startsWith('.')) return host === rule.slice(1) || host.endsWith(rule)
         if (rule.endsWith('.*')) return host.endsWith(rule.slice(0, -2))
         return host === rule || host.endsWith('.' + rule)
@@ -543,7 +548,12 @@ return {
         try {
           const u = new URL(String(raw))
           if (u.protocol === 'http:' || u.protocol === 'https:') {
-            return { host: u.hostname, port: Number(u.port || (u.protocol === 'https:' ? 443 : 80)) }
+            // 认证代理:保留 user:pass@ 凭据,CONNECT 时带 Proxy-Authorization
+            let auth
+            if (u.username || u.password) {
+              auth = Buffer.from(decodeURIComponent(u.username) + ':' + decodeURIComponent(u.password), 'utf8').toString('base64')
+            }
+            return { host: u.hostname, port: Number(u.port || (u.protocol === 'https:' ? 443 : 80)), auth }
           }
         } catch (e) { /* 非法代理值 → 下一个 */ }
       }
@@ -592,6 +602,7 @@ return {
         const method = opts.method || 'GET'
         const body = opts.body
         let settled = false
+        let proxyError = null
         let req = null
         let sock = null
         let tlsSock = null
@@ -621,6 +632,7 @@ return {
               method,
               headers,
               servername: u.hostname,
+              agent: false, // 手动托管的隧道 socket 绝不进默认 agent 的连接池
               createConnection: socket ? () => socket : undefined,
             }, (res) => {
               let text = ''
@@ -637,8 +649,16 @@ return {
               })
               res.on('end', () => { if (!over) finish(resolve, { status: res.statusCode || 0, text }) })
             })
-          } catch (e) { finish(reject, e); return }
-          req.on('error', (e) => { if (!settled) finish(reject, e) })
+          } catch (e) { teardown(); finish(reject, e); return }
+          req.on('error', (e) => {
+            if (!settled) {
+              teardown()
+              // 回退直连失败时合并代理根因(认证 407/拒绝等),避免丢失真实原因
+              finish(reject, proxyError
+                ? new Error(String(e && e.message || e) + ' [proxy: ' + String(proxyError && proxyError.message || proxyError) + ']')
+                : e)
+            }
+          })
           if (body) req.write(body)
           req.end()
           armTimer()
@@ -651,14 +671,16 @@ return {
           }
           const fallbackDirect = (e) => {
             if (settled) return
-            if (phase !== 'connect') { finish(reject, e); return }
+            if (phase !== 'connect') { teardown(); finish(reject, e); return }
             phase = 'done'
             cleanup()
+            proxyError = e // 保存代理失败根因,直连再失败时合并展示(认证 407/拒绝等)
             doRequest(null)
           }
           armTimer() // 覆盖 TCP 连接 + CONNECT 握手全程(黑洞 IP/代理挂起不会永久 pending)
           sock = _ocgoNetConnect(proxy.port, proxy.host, () => {
-            sock.write('CONNECT ' + u.hostname + ':' + (u.port || 443) + ' HTTP/1.1\r\nHost: ' + u.hostname + ':' + (u.port || 443) + '\r\n\r\n')
+            const authHeader = proxy.auth ? '\r\nProxy-Authorization: Basic ' + proxy.auth : ''
+            sock.write('CONNECT ' + u.hostname + ':' + (u.port || 443) + ' HTTP/1.1\r\nHost: ' + u.hostname + ':' + (u.port || 443) + authHeader + '\r\n\r\n')
           })
           let buf = ''
           sock.on('data', (d) => {
@@ -670,8 +692,12 @@ return {
             if (m && m[1] === '200') {
               phase = 'tls'
               cleanup()
+              // CONNECT 响应头之后、同一 TCP 段到达的 TLS 前导字节必须回灌,
+              // 否则被本 data 监听器消费进 buf 后丢失 → TLS 握手间歇性失败。
+              // 必须在 cleanup() 之后 unshift(否则 data 监听器会再次消费并重复解析)。
+              if (buf.length > idx + 4) sock.unshift(Buffer.from(buf.slice(idx + 4), 'latin1'))
               tlsSock = _ocgoTlsConnect({ socket: sock, servername: u.hostname })
-              tlsSock.on('error', (e) => { if (!settled) finish(reject, e) })
+              tlsSock.on('error', (e) => { if (!settled) { teardown(); finish(reject, e) } })
               doRequest(tlsSock)
             } else {
               sock.destroy()
@@ -904,7 +930,9 @@ return {
       const PAGE_SIZE = 50
       const out = { ok: false, error: null, records: [], truncated: false, autoExtracted: false, browser: null }
       const envMap = Object.fromEntries((envs || []).map((e) => [String(e[0]), String(e[1])]))
-      const LAST = envMap.OCGO_LAST_TS || ''
+      // LAST 以数值毫秒比较(与 python 端字符串比较语义等价,但格式/精度差异下更稳健)
+      const LAST = envMap.OCGO_LAST_TS ? Date.parse(envMap.OCGO_LAST_TS) : 0
+      const lastValid = Number.isFinite(LAST) && LAST > 0
       const diskPath = _ocgoJoin(_ocgoHomedir(), '.config', 'dsh-opencode-go-usage-official.json')
       // 1. 配置(authCookie + workspaceId)
       let cfg = null
@@ -913,7 +941,7 @@ return {
       const WID = String((cfg && typeof cfg.workspaceId === 'string' && cfg.workspaceId) || '').replace(/[\r\n]+/g, '').trim()
       if (!CK || !WID) { out.error = 'NO_BROWSER'; return out }
       // 2. 磁盘缓存命中(全量模式,15 分钟内)
-      if (!LAST) {
+      if (!lastValid) {
         try {
           const d = JSON.parse(_ocgoReadFileSync(diskPath, 'utf8'))
           if (d && d.at && Array.isArray(d.records) && Date.now() - d.at < 15 * 60 * 1000) {
@@ -922,43 +950,53 @@ return {
           }
         } catch (e) {}
       }
-      // 3. 分页拉取(16 并发,增量模式首轮只抓前几页即可命中旧记录时间线)
+      // 3. 分页拉取(全量 16 并发;增量小批 4,命中旧记录时间线即停)
       const MAXP = (cfg && Number.isFinite(cfg.maxPages) && cfg.maxPages > 0) ? Math.min(cfg.maxPages, 300) : 150
       const fetchPage = async (page) => {
         const argsEnc = encodeURIComponent(JSON.stringify([WID, page]))
-        const r = await httpRequest('https://opencode.ai/_server?id=' + FID + '&args=' + argsEnc, {
-          headers: {
-            Cookie: 'auth=' + CK,
-            'X-Server-Id': FID,
-            'X-Server-Instance': 'server-fn:ocgo-' + page,
-            Origin: 'https://opencode.ai',
-            Referer: 'https://opencode.ai/workspace/' + WID + '/usage',
-            'User-Agent': UA,
-          },
-        })
-        if (r.status !== 200) throw new Error('usage.list http ' + r.status + ': ' + String(r.text).slice(0, 120))
-        return parseServerText(r.text)
+        const tryFetch = async () => {
+          const r = await httpRequest('https://opencode.ai/_server?id=' + FID + '&args=' + argsEnc, {
+            headers: {
+              Cookie: 'auth=' + CK,
+              'X-Server-Id': FID,
+              'X-Server-Instance': 'server-fn:ocgo-' + page,
+              Origin: 'https://opencode.ai',
+              Referer: 'https://opencode.ai/workspace/' + WID + '/usage',
+              'User-Agent': UA,
+            },
+          })
+          if (r.status !== 200) throw new Error('usage.list http ' + r.status + ' (page ' + page + '): ' + String(r.text).slice(0, 120))
+          return parseServerText(r.text)
+        }
+        try {
+          return await tryFetch()
+        } catch (e) {
+          // 单页失败:短暂退避后重试一次;仍失败则整体失败(不跳过坏页、不落盘残缺数据)
+          await new Promise((r) => setTimeout(r, 300))
+          return await tryFetch()
+        }
       }
       try {
         let page = 0
         let stop = false
+        const batchSize = lastValid ? 4 : 16
         while (page < MAXP && !stop) {
-          const batch = Array.from({ length: Math.min(16, MAXP - page) }, (_, i) => page + i)
-          const results = await mapLimit(batch, 16, fetchPage)
+          const batch = Array.from({ length: Math.min(batchSize, MAXP - page) }, (_, i) => page + i)
+          const results = await mapLimit(batch, batchSize, fetchPage)
           for (let i = 0; i < batch.length; i++) {
             const pgs = results[i]
             if (pgs === null || pgs.length === 0) { stop = true; break }
             out.records.push(...pgs)
             if (pgs.length < PAGE_SIZE) { stop = true; break }
             // 增量模式:页内任一条不新于 LAST → 该页已覆盖 LAST 边界,后续页必然更旧,停止
-            if (LAST && pgs.some((p) => p.ts <= LAST)) { stop = true; break }
+            if (lastValid && pgs.some((p) => Date.parse(p.ts) <= LAST)) { stop = true; break }
           }
           if (!stop) page = batch[batch.length - 1] + 1
           await new Promise((r) => setTimeout(r, 150))
         }
-        out.truncated = out.records.length >= MAXP * PAGE_SIZE
-        if (LAST) {
-          const fresh = out.records.filter((r) => r.ts > LAST)
+        if (lastValid) {
+          // 增量:ts >= LAST(同时间戳的新记录也保留;配合去重键不含 id,不会引入重复)
+          const fresh = out.records.filter((r) => Date.parse(r.ts) >= LAST)
           let old = null
           try { old = JSON.parse(_ocgoReadFileSync(diskPath, 'utf8')) } catch (e) {}
           if (!old || !Array.isArray(old.records)) {
@@ -969,13 +1007,16 @@ return {
           const seen = new Set()
           const combined = []
           for (const r of fresh.concat(old.records)) {
-            const k = [r.id || '', r.ts, r.model, r.cost, r.ti || 0, r.to || 0, r.rt || 0, r.cr || 0].join('|')
+            // 去重键不含 id:与 python 旧盘记录(无 id 字段)同构,迁移期不会键分裂导致重复计费
+            const k = [r.ts, r.model, r.cost, r.ti || 0, r.to || 0, r.rt || 0, r.cr || 0].join('|')
             if (seen.has(k)) continue
             seen.add(k)
             combined.push(r)
           }
           out.records = combined
         }
+        // truncated 基于最终合并后的 records 判定
+        out.truncated = out.records.length >= MAXP * PAGE_SIZE
         // 4. 写盘缓存
         try {
           _ocgoMkdirSync(_ocgoJoin(_ocgoHomedir(), '.config'), { recursive: true })
@@ -1027,7 +1068,12 @@ return {
           // 全量抓取(16 并发,约 10-15s):首次必须返回完整历史(从开通日起),
           // 不能只给近期数据让用户误以为"从导入当天开始"。
           const p = await runOfficial([])
-          if (!p || !p.ok) return { ok: false, error: (p && p.error) || 'unknown' }
+          if (!p || !p.ok) {
+            // 失败也回写缓存:客户端看到真实错误而非永久 loading,并借 15min 缓存实现退避
+            const failed = { ok: false, error: (p && p.error) || 'unknown' }
+            syncOfficialToCache(failed)
+            return failed
+          }
           const data = toOfficialData(p)
           syncOfficialToCache(data)
           return data
@@ -1073,7 +1119,8 @@ return {
         if (typeof _ocgoWriteFileSync !== 'function') return { ok: false, error: 'bundle-only' }
         const cfgPath = _ocgoJoin(_ocgoHomedir(), '.config', 'dsh-opencode-go-usage.json')
         _ocgoMkdirSync(_ocgoJoin(_ocgoHomedir(), '.config'), { recursive: true })
-        _ocgoWriteFileSync(cfgPath, JSON.stringify(payload, null, 1), 'utf8')
+        // auth cookie 是会话凭据:POSIX 下收紧为 0600,避免同机其他用户可读
+        _ocgoWriteFileSync(cfgPath, JSON.stringify(payload, null, 1), { encoding: 'utf8', mode: 0o600 })
         officialCache = null // 清缓存,下次拉取使用新配置
         return { ok: true }
       } catch (e) {
@@ -1132,10 +1179,10 @@ return {
             if (r.costOfficial != null) s.cost += r.costOfficial
             if (r.time > s.updated) s.updated = r.time
           }
-          off.vd.recent = Array.from(bySession.values())
+          off.vd.recent = Array.from(bySession.entries())
+            .map(([id, s]) => ({ id, title: s.title, cost_est: Math.round(s.cost * 10000) / 10000, updated: s.updated }))
             .sort((a, b) => b.updated - a.updated)
             .slice(0, 8)
-            .map((s) => ({ id: 's', title: s.title, cost_est: Math.round(s.cost * 10000) / 10000, updated: s.updated }))
         }
         const data = { ok: true, fetchedAt: Date.now(), quota: quota.error ? null : quota, quotaError: quota.error || null, dsh, official: off || { ok: false, loading: true } }
         cache = { at: Date.now(), data }
