@@ -12,6 +12,7 @@
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { spawnSync } from 'node:child_process'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const PACKAGE_NAME = 'dsh-opencode-go-usage'
@@ -77,7 +78,8 @@ console.log('build + verify ok')
 // 回归门禁:断言运行时关键不变量,防止未来改动静默破坏 bundle 形态。
 // 1) 客户端 bundle 必须是注册形态(否则 web shell 以 classic script 加载即 SyntaxError);
 // 2) 客户端工厂必须从模块表取 react(静态模式没有 React 全局);
-// 3) host 端不得再裸引用 `harness<...>`(静态 bundle 模式没有该全局,裸引用会 ReferenceError)。
+// 3) host 端不得再裸引用 `harness<...>`(静态 bundle 模式没有该全局,裸引用会 ReferenceError);
+// 4) host 产物必须能被 Node 作为 ESM 编译通过(防止字符串拼接引入语法错误,如引号转义错)。
 function verifyLib() {
   const client = readFileSync(join(root, 'lib/client.js'), 'utf8')
   if (!client.startsWith('window.__ModuleLoader__.load({')) {
@@ -93,5 +95,13 @@ function verifyLib() {
   // 允许 `typeof harness` 守卫,禁止裸 `harness.handle(...)` 调用。
   if (/[^.]harness\s*\./.test(host)) {
     throw new Error('lib/index.js 裸引用 harness 全局(build-lib 回归门禁):静态 bundle 模式没有 harness,请用 typeof 守卫')
+  }
+  // ESM 语法编译门禁:node --input-type=module --check 从 stdin 编译,抓引号/转义类语法错误。
+  const check = spawnSync(process.execPath, ['--input-type=module', '--check'], {
+    input: host,
+    encoding: 'utf8',
+  })
+  if (check.status !== 0) {
+    throw new Error('lib/index.js ESM 语法检查失败(build-lib 回归门禁):\n' + String(check.stderr || check.stdout || '').slice(0, 1200))
   }
 }
