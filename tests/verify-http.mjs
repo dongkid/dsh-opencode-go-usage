@@ -127,14 +127,25 @@ await check('usage.list 第一页: 真实拉取 + server-fn 解析', async () =>
 await check('runOfficialHttp 增量模式 (LAST=最新 ts) 只拉新增', async () => {
   const cfg = JSON.parse(readFileSync(process.env.USERPROFILE + '\\.config\\dsh-opencode-go-usage.json', 'utf8'))
   const FID = 'bfd684bfc2e4eed05cd0b518f5e4eafd3f3376e3938abb9e536e7c03df831e5c'
-  const argsEnc = encodeURIComponent(JSON.stringify([cfg.workspaceId, 0]))
-  const r = await api.httpRequest('https://opencode.ai/_server?id=' + FID + '&args=' + argsEnc, {
-    headers: { Cookie: 'auth=' + cfg.authCookie, 'X-Server-Id': FID, 'X-Server-Instance': 'server-fn:ocgo-0' },
-  })
-  const latest = api2.parseServerText(r.text)[0].ts
-  const p = await api2.runOfficialHttp([['OCGO_LAST_TS', latest]])
-  if (!p.ok) throw new Error('incremental failed: ' + JSON.stringify(p).slice(0, 200))
-  console.log(`   incremental returned ${p.records.length} new record(s)`)
+  const diskPath = process.env.USERPROFILE + '\\.config\\dsh-opencode-go-usage-official.json'
+  const fs = await import('node:fs')
+  // 防污染:测试会写真实盘缓存,先备份、测试后还原(否则插件启动会读到此缓存而跳过全量历史抓取)
+  const bak = diskPath + '.verify-bak'
+  const hadDisk = fs.existsSync(diskPath)
+  if (hadDisk) fs.copyFileSync(diskPath, bak)
+  try {
+    const argsEnc = encodeURIComponent(JSON.stringify([cfg.workspaceId, 0]))
+    const r = await api.httpRequest('https://opencode.ai/_server?id=' + FID + '&args=' + argsEnc, {
+      headers: { Cookie: 'auth=' + cfg.authCookie, 'X-Server-Id': FID, 'X-Server-Instance': 'server-fn:ocgo-0' },
+    })
+    const latest = api2.parseServerText(r.text)[0].ts
+    const p = await api2.runOfficialHttp([['OCGO_LAST_TS', latest]])
+    if (!p.ok) throw new Error('incremental failed: ' + JSON.stringify(p).slice(0, 200))
+    console.log(`   incremental returned ${p.records.length} new record(s)`)
+  } finally {
+    try { fs.rmSync(diskPath, { force: true }) } catch (e) {}
+    if (hadDisk) { try { fs.copyFileSync(bak, diskPath); fs.rmSync(bak, { force: true }) } catch (e) {} }
+  }
 })
 
 await check('代理 accept 后挂起 → 15s 超时 reject (C1)', async () => {
